@@ -3,6 +3,7 @@ package traffic
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,12 +14,20 @@ type Bucket struct {
 	minCost         int64
 	maxCost         int64
 	cond            sync.Cond
+	running         atomic.Bool
 }
 
-func (b *Bucket) Start() {
+func (b *Bucket) Stop() bool {
+	return b.running.CompareAndSwap(true, false)
+}
+
+func (b *Bucket) Start() bool {
+	if !b.running.CompareAndSwap(false, true) {
+		return false
+	}
 	go func() {
 		ch := time.Tick(time.Second)
-		for {
+		for b.running.Load() {
 			select {
 			case <-ch:
 				b.cond.L.Lock()
@@ -28,6 +37,7 @@ func (b *Bucket) Start() {
 			}
 		}
 	}()
+	return true
 }
 
 func (b *Bucket) validateSpend(tokens int64) (int64, bool) {
