@@ -3,7 +3,10 @@ package traffic
 import (
 	"container/ring"
 	"hash/maphash"
+	"iter"
+	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 // Hash64 represents all types with [Sum64].
@@ -119,7 +122,7 @@ type StableRing struct {
 	// for use in RouteRequest.
 	reverseLookup map[uint64]uint64
 
-	Ring
+	ring Ring
 }
 
 // NewStableRing constructs a StableRing with the given number of virtual nodes.
@@ -133,6 +136,7 @@ func NewStableRing(virtualNodes int) *StableRing {
 	}
 }
 
+// locks_excluded: ring.mu
 func (r *StableRing) hashBackendNonce(backend, nonce uint64) uint64 {
 	r.h.Reset()
 	for backend > 0 {
@@ -146,29 +150,49 @@ func (r *StableRing) hashBackendNonce(backend, nonce uint64) uint64 {
 	return r.h.Sum64()
 }
 
+// iterNodes iterates over virtual nodes for the backend.
+func (r *StableRing) iterNodes(backend uint64) iter.Seq[uint64] {
+	return func(yield func(uint64) bool) {
+		for i := uint64(0); i < r.numVirtualNodes; i++ {
+			b := r.hashBackendNonce(backend, i)
+			if !yield(b) {
+				return
+			}
+		}
+	}
+}
+
 func (r *StableRing) InsertBackend(backend Hash64) {
 	h64 := backend.Sum64()
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.ring.mu.Lock()
+	defer r.ring.mu.Unlock()
 
-	for i := uint64(0); i < r.numVirtualNodes; i++ {
-		b := r.hashBackendNonce(h64, i)
-		r.insertBackend(b)
-		r.reverseLookup[b] = h64
+	r.insertBackend(h64)
+}
+
+// locks_excluded: ring.mu
+func (r *StableRing) insertBackend(backend uint64) {
+	for n := range r.iterNodes(backend) {
+		r.insertBackend(n)
+		r.reverseLookup[n] = backend
 	}
 }
 
 func (r *StableRing) RemoveBackend(backend Hash64) (removed bool) {
 	h64 := backend.Sum64()
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.ring.mu.Lock()
+	defer r.ring.mu.Unlock()
 
-	for i := uint64(0); i < r.numVirtualNodes; i++ {
-		b := r.hashBackendNonce(h64, i)
-		removed = r.removeBackend(b) || removed
-		delete(r.reverseLookup, b)
+	return r.removeBackend(h64)
+}
+
+// locks_excluded: ring.mu
+func (r *StableRing) removeBackend(backend uint64) (removed bool) {
+	for n := range r.iterNodes(backend) {
+		removed = r.removeBackend(n) || removed
+		delete(r.reverseLookup, n)
 	}
 
 	return removed
@@ -177,12 +201,131 @@ func (r *StableRing) RemoveBackend(backend Hash64) (removed bool) {
 func (r *StableRing) RouteRequest(request Hash64) (backend uint64, ok bool) {
 	h64 := request.Sum64()
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.ring.mu.RLock()
+	defer r.ring.mu.RUnlock()
 
-	b, ok := r.routeRequest(h64)
+	return r.routeRequest(h64)
+}
+
+// locks_excluded: ring.mu
+func (r *StableRing) routeRequest(req uint64) (backend uint64, ok bool) {
+	b, ok := r.routeRequest(req)
 	if ok {
 		b, ok = r.reverseLookup[b]
 	}
 	return b, ok
+}
+
+type nodeEntry struct {
+	node    uint64
+	backend uint64
+}
+
+func cmpNodeEntry(a, b nodeEntry) int {
+	if a.node < b.node {
+		return -1
+	}
+	if b.node < a.node {
+		return +1
+	}
+	return 0
+}
+
+// CachedStableRing wraps StableRing with a cache which improves the
+// amortized performance of the key routing function [RouteRequest].
+type CachedStableRing struct {
+	// Cache nodes to a slice to enable a more performant binary search algorithm.
+	cache []nodeEntry
+	gen   atomic.Uint64 // generation counter
+	mu    sync.RWMutex  // for cache
+
+	ring *StableRing
+}
+
+func NewCachedStableRing(numVirtualNodes int) *CachedStableRing {
+	r := &CachedStableRing{}
+	r.ring = NewStableRing(numVirtualNodes) // may panic.
+	return r
+}
+
+func (r *CachedStableRing) nextGen(currGen uint64) bool {
+	return r.gen.CompareAndSwap(currGen, currGen+1)
+}
+
+// precondition: nextGen.
+// locked_excluded: ring.ring.mu
+func (r *CachedStableRing) rebuildCache() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache = r.cache[:0]
+	r.ring.ring.ring.Do(func(v any) {
+		node := v.(uint64)
+		r.cache = append(r.cache, nodeEntry{
+			node:    node,
+			backend: r.ring.reverseLookup[node],
+		})
+	})
+}
+
+func (r *CachedStableRing) InsertBackend(backend Hash64) {
+	h64 := backend.Sum64()
+
+	r.ring.ring.mu.Lock()
+	defer r.ring.ring.mu.Unlock()
+	r.insertBackend(h64)
+}
+
+// locks_excluded: ring.ring.mu
+func (r *CachedStableRing) insertBackend(backend uint64) {
+	currGen := r.gen.Load()
+	r.ring.insertBackend(backend)
+	if r.nextGen(currGen) {
+		r.rebuildCache()
+	}
+}
+
+func (r *CachedStableRing) RemoveBackend(backend Hash64) (removed bool) {
+	h64 := backend.Sum64()
+
+	r.ring.ring.mu.Lock()
+	defer r.ring.ring.mu.Unlock()
+	return r.removeBackend(h64)
+}
+
+// locks_excluded: ring.ring.mu
+func (r *CachedStableRing) removeBackend(backend uint64) (removed bool) {
+	currGen := r.gen.Load()
+	removed = r.ring.removeBackend(backend)
+	if removed && r.nextGen(currGen) {
+		r.rebuildCache()
+	}
+	return removed
+}
+
+func (r *CachedStableRing) RouteRequest(request Hash64) (backend uint64, ok bool) {
+	h64 := request.Sum64()
+
+	r.ring.ring.mu.RLock()
+	defer r.ring.ring.mu.RUnlock()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.routeRequestFast(h64)
+}
+
+// routeRequestFast runs in logarithmic time.
+//
+// locks_excluded: ring.ring.mu, mu.
+func (r *CachedStableRing) routeRequestFast(req uint64) (backend uint64, ok bool) {
+	n := len(r.cache)
+	if n == 0 {
+		return 0, false // No nodes.
+	}
+	dummy := nodeEntry{req, 0}
+	i, _ := slices.BinarySearchFunc(r.cache, dummy, cmpNodeEntry)
+	if i == n {
+		i-- // When insert position = n, use last node.
+	}
+	return r.cache[i].backend, true
 }
