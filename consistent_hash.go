@@ -181,9 +181,8 @@ func (r *StableRing) RouteRequest(request Hash64) (backend uint64, ok bool) {
 	defer r.mu.RUnlock()
 
 	b, ok := r.routeRequest(h64)
-	if !ok {
-		return 0, false // No backend found.
+	if ok {
+		b, ok = r.reverseLookup[b]
 	}
-	b, ok = r.reverseLookup[b]
 	return b, ok
 }
