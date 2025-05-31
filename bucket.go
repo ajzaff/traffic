@@ -28,13 +28,11 @@ func (b *Bucket) Start() bool {
 	go func() {
 		ch := time.Tick(time.Second)
 		for b.running.Load() {
-			select {
-			case <-ch:
-				b.cond.L.Lock()
-				b.availableTokens = min(b.capacity, b.availableTokens+b.newTokensPerSec)
-				b.cond.Broadcast()
-				b.cond.L.Unlock()
-			}
+			<-ch
+			b.cond.L.Lock()
+			b.availableTokens = min(b.capacity, b.availableTokens+b.newTokensPerSec)
+			b.cond.Broadcast()
+			b.cond.L.Unlock()
 		}
 	}()
 	return true
