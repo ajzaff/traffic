@@ -174,7 +174,7 @@ func (r *StableRing) InsertBackend(backend Hash64) {
 // locks_excluded: ring.mu
 func (r *StableRing) insertBackend(backend uint64) {
 	for n := range r.iterNodes(backend) {
-		r.insertBackend(n)
+		r.ring.insertBackend(n)
 		r.reverseLookup[n] = backend
 	}
 }
@@ -191,7 +191,7 @@ func (r *StableRing) RemoveBackend(backend Hash64) (removed bool) {
 // locks_excluded: ring.mu
 func (r *StableRing) removeBackend(backend uint64) (removed bool) {
 	for n := range r.iterNodes(backend) {
-		removed = r.removeBackend(n) || removed
+		removed = r.ring.removeBackend(n) || removed
 		delete(r.reverseLookup, n)
 	}
 
@@ -209,7 +209,7 @@ func (r *StableRing) RouteRequest(request Hash64) (backend uint64, ok bool) {
 
 // locks_excluded: ring.mu
 func (r *StableRing) routeRequest(req uint64) (backend uint64, ok bool) {
-	b, ok := r.routeRequest(req)
+	b, ok := r.ring.routeRequest(req)
 	if ok {
 		b, ok = r.reverseLookup[b]
 	}
@@ -311,18 +311,12 @@ func (r *CachedStableRing) RouteRequest(request Hash64) (backend uint64, ok bool
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	return r.routeRequestFast(h64)
-}
-
-// routeRequestFast runs in logarithmic time.
-//
-// locks_excluded: ring.ring.mu, mu.
-func (r *CachedStableRing) routeRequestFast(req uint64) (backend uint64, ok bool) {
+	// fast path always runs in logarithmic time.
 	n := len(r.cache)
 	if n == 0 {
 		return 0, false // No nodes.
 	}
-	dummy := nodeEntry{req, 0}
+	dummy := nodeEntry{h64, 0}
 	i, _ := slices.BinarySearchFunc(r.cache, dummy, cmpNodeEntry)
 	if i == n {
 		i-- // When insert position = n, use last node.
