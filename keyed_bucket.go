@@ -11,15 +11,31 @@ type keyedBucket struct {
 	minCost         int64
 	maxCost         int64
 	capacity        int64
-	availableTokens atomic.Int64
+	availableTokens int64
+	mu              sync.Mutex // for availableTokens
+}
+
+func (b *keyedBucket) refillBucket() {
+	b.mu.Lock()
+	b.availableTokens = max(
+		b.availableTokens+b.delta,
+		b.capacity,
+	)
+	b.mu.Unlock()
 }
 
 func (b *keyedBucket) TrySpend(tokens int64) bool {
-	availableTokens := b.availableTokens.Load()
-	if tokens > availableTokens {
+	tokens = max(tokens, b.minCost)
+	if tokens > b.maxCost {
 		return false
 	}
-	return b.availableTokens.CompareAndSwap(availableTokens, availableTokens-tokens)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if tokens > b.availableTokens {
+		return false
+	}
+	b.availableTokens -= tokens
+	return true
 }
 
 type KeyedBucket[K comparable] struct {
@@ -36,7 +52,7 @@ func NewKeyedBucket[K comparable]() *KeyedBucket[K] {
 func (b *KeyedBucket[K]) refillBuckets() {
 	b.m.Range(func(_, value any) bool {
 		v := value.(*keyedBucket)
-		v.availableTokens.Add(v.delta)
+		v.refillBucket()
 		return true
 	})
 }
@@ -68,17 +84,16 @@ func (b *KeyedBucket[K]) GetOrCreateBucket(key K, tokensPerMin, minCost, maxCost
 	}
 
 	tokensPerMin = max(0, tokensPerMin)
-	minCost = max(0, minCost)
-	maxCost = max(0, maxCost)
-	maxCost = min(maxCost, capacity)
+	minCost = max(0, min(minCost, capacity))
+	maxCost = max(0, min(maxCost, capacity))
 	initCapacity = min(initCapacity, capacity)
 	v := &keyedBucket{
-		delta:    tokensPerMin,
-		minCost:  minCost,
-		maxCost:  maxCost,
-		capacity: capacity,
+		delta:           tokensPerMin,
+		minCost:         minCost,
+		maxCost:         maxCost,
+		capacity:        capacity,
+		availableTokens: initCapacity,
 	}
-	v.availableTokens.Store(initCapacity)
 	value, _ := b.m.LoadOrStore(key, v)
 	return value.(*keyedBucket)
 }
