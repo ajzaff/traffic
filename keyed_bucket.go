@@ -17,7 +17,7 @@ type keyedBucket struct {
 
 func (b *keyedBucket) refillBucket() {
 	b.mu.Lock()
-	b.availableTokens = max(
+	b.availableTokens = min(
 		b.availableTokens+b.delta,
 		b.capacity,
 	)
