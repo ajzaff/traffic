@@ -64,4 +64,13 @@ func TestBoundedQueue(t *testing.T) {
 	if got, want := cancelCount.Load(), int64(10); got != want {
 		t.Errorf("cancel count is not correct, wanted %d, got %d", want, got)
 	}
+
+	// Check expected P sum
+	sum := int64(0)
+	for e := q.slots.Front(); e != nil; e = e.Next() {
+		sum += e.Value.(boundedQueueElem).priority
+	}
+	if gotSum, wantSum := sum, 10*int64(100); gotSum != wantSum {
+		t.Errorf("P sum is not correct, wanted %d, got %d", wantSum, gotSum)
+	}
 }
